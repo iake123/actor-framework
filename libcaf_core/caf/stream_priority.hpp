@@ -26,14 +26,22 @@ namespace caf {
 
 /// Categorizes individual streams.
 enum class stream_priority {
-  /// Denotes best-effort traffic.
-  low,
+  /// Denotes soft-realtime traffic.
+  very_high,
+  /// Denotes time-sensitive traffic.
+  high,
   /// Denotes traffic with moderate timing requirements.
   normal,
-  /// Denotes soft-realtime traffic.
-  high
+  /// Denotes uncritical traffic without timing requirements.
+  low,
+  /// Denotes best-effort traffic.
+  very_low
 };
 
+/// Stores the number of `stream_priority` classes.
+static constexpr size_t stream_priorities = 5;
+
+/// @relates stream_priority
 std::string to_string(stream_priority x);
 
 } // namespace caf

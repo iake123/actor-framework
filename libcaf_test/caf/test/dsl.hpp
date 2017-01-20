@@ -344,3 +344,7 @@ struct test_coordinator_fixture {
   CAF_MESSAGE("expect" << #types << "." << #fields);                           \
   expect< CAF_EXPAND(CAF_DSL_LIST types) >().fields
 
+#define expect_on(where, types, fields)                                        \
+  CAF_MESSAGE(#where << ": expect" << #types << "." << #fields);       \
+  where . expect< CAF_EXPAND(CAF_DSL_LIST types) >().fields
+

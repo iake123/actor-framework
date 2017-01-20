@@ -145,6 +145,12 @@ behavior config_serv_impl(stateful_actor<kvstate>* self) {
   };
 }
 
+// -- spawn server -------------------------------------------------------------
+
+// A spawn server allows users to spawn actors dynamically with a name and a
+// message containing the data for initialization. By accessing the spawn server
+// on another node, users can spwan actors remotely.
+
 struct spawn_serv_state {
   static const char* name;
 };
@@ -162,6 +168,212 @@ behavior spawn_serv_impl(stateful_actor<spawn_serv_state>* self) {
                                                     self->context(), true, &xs);
     }
   };
+}
+
+// -- stream server ------------------------------------------------------------
+
+// The stream server acts as a man-in-the-middle for all streams that cross the
+// network. It manages any number of unrelated streams by placing itself and the
+// stream server on the next remote node into the pipeline.
+
+// Outgoing messages are buffered in FIFO order to ensure fairness. However, the
+// stream server uses five different FIFO queues: on for each priority level.
+// A high priority grants more network bandwidth.
+
+// Note that stream servers do not actively take part in the streams they
+// process. Batch messages and ACKs are treated equally. Open, close, and error
+// messages are evaluated to add and remove state as needed.
+
+class prioritized_stream_buffers {
+public:
+  using stream_buffer = std::deque<stream_msg>;
+
+  using stream_buffers = std::vector<stream_buffer>;
+
+  stream_buffers& operator[](stream_priority x) {
+    return data_[static_cast<size_t>(x)];
+  }
+
+private:
+  std::array<stream_buffers, stream_priorities> data_;
+};
+
+// Forwards incoming stream messages to local actors.
+class inbound_stream_handler {
+public:
+  /// Allow `variant` to recognize this type as a visitor.
+  using result_type = void;
+
+  virtual ~inbound_stream_handler() {
+    // nop
+  }
+
+  void operator()(stream_msg::open&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::ack_open&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::batch&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::ack_batch&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::close&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::abort&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::downstream_failed&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::upstream_failed&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+};
+
+// Forwards outgoing stream messages to remote actors.
+class outbound_stream_handler {
+public:
+  /// Allow `variant` to recognize this type as a visitor.
+  using result_type = void;
+
+  virtual ~outbound_stream_handler() {
+    // nop
+  }
+
+  void operator()(stream_msg::open&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::ack_open&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::batch&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::ack_batch&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::close&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::abort&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::downstream_failed&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  void operator()(stream_msg::upstream_failed&) {
+    CAF_ASSERT(current_stream_ != nullptr);
+    CAF_ASSERT(current_forwarder_ != nullptr);
+  }
+
+  // Stores which stream is currently processed.
+  const stream_id* current_stream_ = nullptr;
+
+  // Stores which actor forwarded the current `stream_msg`.
+  const actor* current_forwarder_ = nullptr;
+};
+
+class stream_serv_class : public scheduled_actor {
+public:
+  /// Allows `actor_system` to recognize this actor as dynamically typed.
+  using behavior_type = behavior;
+
+  /// Allows to use `*this` as visitor for `stream_msg`.
+  using result_type = void;
+
+  /// Stores all peers, i.e., `stream_serv` instances on other nodes.
+  using peer_map = std::unordered_map<node_id, actor>;
+
+  /// Stores pending streames awaiting credit.
+  using stream_buffer = std::deque<stream_msg>;
+
+  stream_serv_class(actor_config& cfg) : scheduled_actor(cfg) {
+    // nop
+  }
+
+  const char* name() const override {
+    return "stream_serv";
+  }
+
+  resume_result resume(execution_unit*, size_t) override {
+    mailbox_element_ptr ptr;
+    for (;;) {
+      ptr = next_message();
+      if (!ptr) {
+        if (mailbox().try_block())
+          return resumable::awaiting_message;
+        continue;
+      }
+      auto& content = ptr->content();
+      switch (content.type_token()) {
+        // handle exit messages properly
+        case make_type_token<exit_msg>(): {
+          auto em = content.move_if_unshared<exit_msg>(0);
+          unlink_from(em.source);
+          if (em.reason != exit_reason::normal) {
+            fail_state_ = std::move(em.reason);
+            setf(is_terminated_flag);
+            finalize();
+            return resume_result::done;
+          }
+          break;
+        }
+        // process stream messages from local actors (forwarding)
+        case make_type_token<actor, stream_msg>(): {
+          auto& x = content.get_mutable_as<stream_msg>(1);
+          out_.current_stream_ = &x.sid;
+          out_.current_forwarder_ = &content.get_as<actor>(0);
+          apply_visitor(out_, x.content);
+          break;
+        }
+        // ignore everything else
+        default: {
+          // nop
+        }
+      }
+    }
+  }
+
+private:
+  inbound_stream_handler in_;
+  outbound_stream_handler out_;
+};
+
+behavior stream_serv_impl(stream_serv_class*) {
+  return [] {};
 }
 
 class dropping_execution_unit : public execution_unit {
@@ -259,12 +471,14 @@ actor_system::actor_system(actor_system_config& cfg)
   groups_.init(cfg);
   // spawn config and spawn servers (lazily to not access the scheduler yet)
   static constexpr auto Flags = hidden + lazy_init;
-  spawn_serv_ = actor_cast<strong_actor_ptr>(spawn<Flags>(spawn_serv_impl));
-  config_serv_ = actor_cast<strong_actor_ptr>(spawn<Flags>(config_serv_impl));
+  spawn_serv(actor_cast<strong_actor_ptr>(spawn<Flags>(spawn_serv_impl)));
+  config_serv(actor_cast<strong_actor_ptr>(spawn<Flags>(config_serv_impl)));
+  stream_serv(actor_cast<strong_actor_ptr>(spawn<Flags>(stream_serv_impl)));
   // fire up remaining modules
   registry_.start();
-  registry_.put(atom("SpawnServ"), spawn_serv_);
-  registry_.put(atom("ConfigServ"), config_serv_);
+  registry_.put(atom("SpawnServ"), spawn_serv());
+  registry_.put(atom("ConfigServ"), config_serv());
+  registry_.put(atom("StreamServ"), stream_serv());
   for (auto& mod : modules_)
     if (mod)
       mod->start();
@@ -276,14 +490,14 @@ actor_system::~actor_system() {
   CAF_LOG_DEBUG("shutdown actor system");
   if (await_actors_before_shutdown_)
     await_all_actors_done();
-  // shutdown system-level servers
-  anon_send_exit(spawn_serv_, exit_reason::user_shutdown);
-  anon_send_exit(config_serv_, exit_reason::user_shutdown);
-  // release memory as soon as possible
-  spawn_serv_ = nullptr;
-  config_serv_ = nullptr;
+  // shutdown internal actors
+  for (auto& x : internal_actors_) {
+    anon_send_exit(x, exit_reason::user_shutdown);
+    x = nullptr;
+  }
   registry_.erase(atom("SpawnServ"));
   registry_.erase(atom("ConfigServ"));
+  registry_.erase(atom("StreamServ"));
   // group module is the first one, relies on MM
   groups_.stop();
   // stop modules in reverse order

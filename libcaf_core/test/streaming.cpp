@@ -26,6 +26,10 @@
 #define CAF_SUITE streaming
 #include "caf/test/dsl.hpp"
 
+#include "caf/io/middleman.hpp"
+#include "caf/io/basp_broker.hpp"
+#include "caf/io/network/test_multiplexer.hpp"
+
 using std::cout;
 using std::endl;
 using std::string;
@@ -195,7 +199,7 @@ using fixture = test_coordinator_fixture<>;
 
 } // namespace <anonymous>
 
-CAF_TEST_FIXTURE_SCOPE(streaming_tests, fixture)
+CAF_TEST_FIXTURE_SCOPE(local_streaming_tests, fixture)
 
 CAF_TEST(no_downstream) {
   CAF_MESSAGE("opening streams must fail if no downstream stage exists");
@@ -415,4 +419,144 @@ CAF_TEST(stream_without_result) {
   expect((void), from(sink).to(source).with());
 }
 
-CAF_TEST_FIXTURE_SCOPE_END()
+CAF_TEST_FIXTURE_SCOPE_END() // local_streaming_tests
+
+namespace {
+
+using namespace caf::io;
+
+class remoting_config : public actor_system_config {
+public:
+  remoting_config() {
+    load<middleman, network::test_multiplexer>();
+  }
+};
+
+basp_broker* get_basp_broker(middleman& mm) {
+  auto hdl = mm.named_broker<basp_broker>(atom("BASP"));
+  return dynamic_cast<basp_broker*>(actor_cast<abstract_actor*>(hdl));
+}
+
+class sub_fixture : public test_coordinator_fixture<remoting_config> {
+public:
+  middleman& mm;
+  network::test_multiplexer& mpx;
+  basp_broker* basp;
+  connection_handle conn;
+  accept_handle acc;
+  sub_fixture* peer = nullptr;
+  strong_actor_ptr stream_serv;
+
+  sub_fixture()
+      : mm(sys.middleman()),
+        mpx(dynamic_cast<network::test_multiplexer&>(mm.backend())),
+        basp(get_basp_broker(mm)),
+        stream_serv(sys.stream_serv()) {
+    // nop
+  }
+
+  void publish(actor whom, uint16_t port) {
+    auto ma = mm.actor_handle();
+    scoped_actor self{sys};
+    std::set<std::string> sigs;
+    // make sure no pending BASP broker messages are in the queu
+    mpx.flush_runnables();
+    // trigger middleman actor
+    self->send(ma, publish_atom::value, port,
+               actor_cast<strong_actor_ptr>(std::move(whom)), std::move(sigs),
+               "", false);
+    // wait for the message of the middleman actor
+    mpx.exec_runnable();
+    // fetch response
+    self->receive(
+      [](uint16_t) {
+        // nop
+      },
+      [&](error& err) {
+        CAF_FAIL(sys.render(err));
+      }
+    );
+  }
+
+  actor remote_actor(std::string host, uint16_t port) {
+    auto ma = mm.actor_handle();
+    scoped_actor self{sys};
+    CAF_MESSAGE("remote actor: " << host << ":" << port);
+    // make sure no pending BASP broker messages are in the queu
+    mpx.flush_runnables();
+    // trigger middleman actor
+    self->send(ma, connect_atom::value, std::move(host), port);
+    // wait for the message of the middleman actor
+    mpx.exec_runnable();
+    // tell peer to accept the connection
+    peer->mpx.accept_connection(peer->acc);
+    // run handshake between the two BASP broker instances
+    while (mpx.try_exec_runnable() || peer->mpx.try_exec_runnable()
+           || mpx.read_data() || peer->mpx.read_data()) {
+      // re-run until handhsake is fully completed
+    }
+    CAF_MESSAGE("fetch remote actor proxy");
+    actor result;
+    self->receive(
+      [&](node_id&, strong_actor_ptr& ptr, std::set<std::string>&) {
+        result = actor_cast<actor>(std::move(ptr));
+      },
+      [&](error& err) {
+        CAF_FAIL(sys.render(err));
+      }
+    );
+    return result;
+  }
+};
+
+} // namespace <anonymous>
+
+CAF_TEST(stream_crossing_the_wire) {
+  sub_fixture mars;
+  sub_fixture earth;
+  mars.peer = &earth;
+  earth.peer = &mars;
+  // earth (streamer_without_result) streams to mars (drop_all)
+  CAF_MESSAGE("spawn drop_all sink on mars");
+  auto sink = mars.sys.spawn(drop_all);
+  // this test uses two fixtures for keeping state
+  earth.conn = connection_handle::from_int(1);
+  mars.conn = connection_handle::from_int(2);
+  mars.acc = accept_handle::from_int(3);
+  // prepare publish and remote_actor calls
+  CAF_MESSAGE("prepare connections on earth and mars");
+  mars.mpx.prepare_connection(mars.acc, mars.conn, earth.mpx, "mars", 8080,
+                              earth.conn);
+  // publish sink on mars
+  CAF_MESSAGE("publish sink on mars");
+  mars.publish(sink, 8080);
+  // get a proxy on earth
+  CAF_MESSAGE("connect from earth to mars");
+  auto proxy = earth.remote_actor("mars", 8080);
+  CAF_MESSAGE("got proxy: " << to_string(proxy) << ", spawn streamer on earth");
+  earth.sched.run();
+  auto source = earth.sys.spawn(streamer_without_result, proxy);
+  // run initialization code
+  earth.sched.run_once();
+  // source ----(stream_msgreturn ::open)----> sink
+  expect_on(earth, (stream_msg::open),
+            from(source).to(earth.stream_serv).with(_, source, _, _, false));
+  /*
+  // source <----(stream_msg::ack_open)------ sink
+  expect((stream_msg::ack_open), from(sink).to(source).with(5, _, false));
+  // source ----(stream_msg::batch)---> sink
+  expect((stream_msg::batch),
+         from(source).to(sink).with(5, std::vector<int>{1, 2, 3, 4, 5}, 0));
+  // source <--(stream_msg::ack_batch)---- sink
+  expect((stream_msg::ack_batch), from(sink).to(source).with(5, 0));
+  // source ----(stream_msg::batch)---> sink
+  expect((stream_msg::batch),
+         from(source).to(sink).with(4, std::vector<int>{6, 7, 8, 9}, 1));
+  // source <--(stream_msg::ack_batch)---- sink
+  expect((stream_msg::ack_batch), from(sink).to(source).with(4, 1));
+  // source ----(stream_msg::close)---> sink
+  expect((stream_msg::close), from(source).to(sink).with());
+  // sink ----(result: <empty>)---> source
+  expect((void), from(sink).to(source).with());
+  */
+}
